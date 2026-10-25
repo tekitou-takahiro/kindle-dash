@@ -38,7 +38,7 @@ CONFIG = {
     # 表示する鉄道路線。match は Yahoo!路線情報 / JR西日本の路線名に含まれる文字列
     # JR は match="*" で近畿エリアの全路線を対象にし、遅れのある路線名を列挙する
     "train_lines": [
-        {"label": "JR西日本(近畿)", "match": "*", "source": "jrwest"},
+        {"label": "JR", "match": "*", "source": "jrwest"},
         {"label": "御堂筋線", "match": "御堂筋線", "source": "yahoo"},
         {"label": "谷町線", "match": "谷町線", "source": "yahoo"},
         {"label": "京阪電車", "match": "京阪", "source": "yahoo"},  # 京阪本線・中之島線など
@@ -51,6 +51,8 @@ CONFIG = {
     # 1時間降水量(Open-Meteo)。東住吉区役所付近の座標
     "lat_lon": (34.6142, 135.5285),
     "rain_hours": 12,
+    # JR は近畿エリアのうち、ここに含まれる路線の遅れだけを表示する(路線名の部分一致)
+    "jr_watch": ["大阪環状線", "阪和線", "大和路線", "京都線", "神戸線", "東西線", "ゆめ咲線"],
     # 市況の更新時刻(JST)。それ以外の実行時は前回取得分(キャッシュ)を表示する
     # 7:00 = 米国市場の終値確定後 / 16:00 = 東京市場の終値確定後
     "market_update_times": ["07:00", "16:00"],
@@ -58,7 +60,9 @@ CONFIG = {
     "markets": [
         {"label": "ドル円", "kind": "fx", "sources": [("yahoo", "JPY=X"), ("stooq", "usdjpy")]},
         {"label": "日経平均", "sources": [("yahoo", "^N225"), ("stooq", "^nkx")]},
-        {"label": "TOPIX", "sources": [("stooq", "^tpx"), ("yahoo", "^TOPX")]},
+        # TOPIX は指数そのものが取れない場合、連動ETF(1306)で前日比だけ代用する
+        {"label": "TOPIX", "sources": [("yahoo", "998405.T"), ("stooq", "^tpx"), ("yahoo", "^TOPX"),
+                                       ("yahoo", "1306.T", "(ETF)")]},
         {"label": "ダウ", "sources": [("yahoo", "^DJI"), ("stooq", "^dji")]},
         {"label": "NASDAQ", "sources": [("yahoo", "^IXIC"), ("stooq", "^ndq")]},
         {"label": "WTI原油", "kind": "usd", "sources": [("yahoo", "CL=F"), ("stooq", "cl.f")]},
@@ -202,11 +206,17 @@ def fetch_jrwest(lines: list[dict], dump_dir: Path | None) -> dict[str, TrainSta
     key_to_name = {k: n for n, k in name_to_key.items()}
     for ln in lines:
         if ln["match"] == "*":
-            if troubled:
-                names = [key_to_name.get(k, k) for k in troubled]
+            watch = CONFIG.get("jr_watch") or []
+            relevant = {k: t for k, t in troubled.items()
+                        if not watch or any(w in key_to_name.get(k, k) for w in watch)}
+            if relevant:
+                names = [key_to_name.get(k, k) for k in relevant]
                 details = []
-                for k, t in troubled.items():
-                    details.append(f"{key_to_name.get(k, k)}: " + " ".join(_flatten_strings(t)))
+                for k, t in relevant.items():
+                    # URL や英字だけの値(内部キー)は除き、日本語の説明だけ残す
+                    words = [w for w in _flatten_strings(t)
+                             if not w.startswith("http") and re.search(r"[ぁ-んァ-ン一-龥]", w)]
+                    details.append(f"{key_to_name.get(k, k)}: " + " ".join(words))
                 out[ln["label"]] = TrainStatus(ln["label"], "遅れあり", " / ".join(details)[:160], False)
                 out[ln["label"]].lines = names
             else:
@@ -296,6 +306,7 @@ def fetch_news(dump_dir: Path | None) -> list[str]:
 class HourlyRain:
     hours: list[int]       # 時(0-23)
     mm: list[float]        # 1時間降水量 mm
+    current_temp: float | None = None  # 現在気温(夜は今日の最高気温の代わりに表示)
 
 
 def fetch_rain(dump_dir: Path | None) -> HourlyRain:
@@ -303,7 +314,7 @@ def fetch_rain(dump_dir: Path | None) -> HourlyRain:
     lat, lon = CONFIG["lat_lon"]
     url = ("https://api.open-meteo.com/v1/forecast"
            f"?latitude={lat}&longitude={lon}&hourly=precipitation"
-           "&timezone=Asia%2FTokyo&forecast_days=2")
+           "&current=temperature_2m&timezone=Asia%2FTokyo&forecast_days=2")
     raw = http_get(url)
     if dump_dir:
         (dump_dir / "openmeteo.json").write_bytes(raw)
@@ -319,7 +330,8 @@ def fetch_rain(dump_dir: Path | None) -> HourlyRain:
             mm.append(float(v or 0))
     if not hours:
         raise ValueError("予報データが空")
-    return HourlyRain(hours, mm)
+    cur = (j.get("current") or {}).get("temperature_2m")
+    return HourlyRain(hours, mm, cur)
 
 
 # ---- 市況 ------------------------------------------------------------
@@ -344,12 +356,13 @@ def _yahoo_chart(symbol: str) -> tuple[float, float]:
     j = json.loads(http_get(url))
     res = j["chart"]["result"][0]
     meta = res["meta"]
-    price = meta.get("regularMarketPrice")
-    closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
-    if price is None:
-        price = closes[-1]
-    # 当日分の足がまだ無いときは最後の終値が前日終値
-    prev = closes[-2] if len(closes) >= 2 and abs(closes[-1] - price) < 1e-9 else closes[-1]
+    bars = [(t, c) for t, c in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]) if c is not None]
+    price = meta.get("regularMarketPrice") or bars[-1][1]
+    off = dt.timedelta(seconds=meta.get("gmtoffset", 0))
+    day = lambda ts: (dt.datetime.fromtimestamp(ts, dt.timezone.utc) + off).date()  # noqa: E731
+    mkt_day = day(meta.get("regularMarketTime", bars[-1][0]))
+    # 最後の足が直近の取引日なら、その1本前が前日終値。足がまだ無ければ最後の足が前日終値
+    prev = bars[-2][1] if day(bars[-1][0]) == mkt_day and len(bars) >= 2 else bars[-1][1]
     return float(price), float(prev)
 
 
@@ -373,9 +386,12 @@ def fetch_markets(dump_dir: Path | None) -> list[Quote]:
     for m in CONFIG["markets"]:
         q = Quote(m["label"], None, None, m.get("kind", "index"))
         errs = []
-        for prov, sym in m["sources"]:  # 上から順に試し、取れた時点で終了
+        for src in m["sources"]:  # 上から順に試し、取れた時点で終了
+            prov, sym = src[0], src[1]
             try:
                 q.value, q.prev = PROVIDERS[prov](sym)
+                if len(src) > 2:  # 代用データのときは表示名に印を付ける
+                    q.label = m["label"] + src[2]
                 break
             except Exception as e:  # noqa: BLE001
                 errs.append(f"{prov}:{sym}:{type(e).__name__}")
@@ -408,11 +424,17 @@ def load_markets(cache_path: Path, dump_dir: Path | None, force: bool = False):
         cached = [Quote(**q) for q in c["quotes"]]
     except (FileNotFoundError, KeyError, ValueError, TypeError):
         pass
-    if not force and cached is not None and fetched_at >= _last_slot(now):
+    complete = cached is not None and all(q.value is not None for q in cached)
+    if not force and complete and fetched_at >= _last_slot(now):
         return cached, fetched_at
+    # 更新時刻を過ぎた、または前回取れなかった銘柄がある → 取り直す
     quotes = fetch_markets(dump_dir)
-    if all(q.value is None for q in quotes) and cached is not None:
-        return cached, fetched_at  # 全滅なら古い値を残す
+    if all(q.value is None for q in quotes):
+        # 全滅: キャッシュは書かない(次回の実行で再挑戦する)
+        return (cached, fetched_at) if cached is not None else (quotes, None)
+    if cached is not None:  # 一部だけ失敗した銘柄は前回の値で埋める
+        old = {q.label: q for q in cached}
+        quotes = [old[q.label] if q.value is None and q.label in old else q for q in quotes]
     cache_path.write_text(json.dumps(
         {"fetched_at": now.isoformat(), "quotes": [q.__dict__ for q in quotes]},
         ensure_ascii=False, indent=1), encoding="utf-8")
@@ -671,9 +693,14 @@ def render(weather: Weather | None, trains: list[TrainStatus], news: list[str] |
             p.text((x0, yy), label, 38)
             draw_weather_icon(d, day.code, x0 + 80, yy + 128, 66)
             tx = x0 + 186
-            p.text((tx, yy + 50), f"{day.tmax or '-'}°", 88)
-            if day.tmin:
-                p.text((tx + 6, yy + 152), f"最低 {day.tmin}°", 32, bold=False)
+            if not day.tmax and i == 0 and rain and rain.current_temp is not None:
+                # 気象庁は夕方以降「今日の最高気温」を出さないので、現在気温を出す
+                p.text((tx, yy + 50), f"{rain.current_temp:.0f}°", 88)
+                p.text((tx + 6, yy + 152), "現在の気温", 32, bold=False)
+            else:
+                p.text((tx, yy + 50), f"{day.tmax or '-'}°", 88)
+                if day.tmin:
+                    p.text((tx + 6, yy + 152), f"最低 {day.tmin}°", 32, bold=False)
             for k, line in enumerate(p.wrap(day.text or "", 30, col_w - 10, bold=False, max_lines=2)):
                 p.text((x0, yy + 210 + k * 40), line, 30, bold=False)
             labels = ["0-6", "6-12", "12-18", "18-24"]
