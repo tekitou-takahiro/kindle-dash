@@ -1,0 +1,70 @@
+name: Kindle dashboard
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 日本語フォントを入れる
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+
+      - name: 依存パッケージ
+        run: pip install -r requirements.txt
+
+      - name: 前回の市況キャッシュを公開中のサイトから取り戻す
+        run: |
+          mkdir -p out
+          curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/markets_cache.json" \
+            -o out/markets_cache.json || rm -f out/markets_cache.json
+
+      - name: 画像を生成
+        run: python dashboard.py
+
+      - name: 公開用フォルダを作る
+        run: |
+          mkdir -p site
+          cp out/dashboard.png out/dashboard_preview.png site/
+          [ -f out/markets_cache.json ] && cp out/markets_cache.json site/ || true
+          cat > site/index.html <<'EOF'
+          <!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+          <title>Kindle dashboard</title>
+          <body style="margin:0;background:#888">
+          <img src="dashboard_preview.png" style="width:100%;height:auto;display:block">
+          EOF
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
