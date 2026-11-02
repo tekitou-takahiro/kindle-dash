@@ -47,7 +47,10 @@ CONFIG = {
     "yahoo_area_url": "https://transit.yahoo.co.jp/diainfo/area/6",
     "jrwest_base": "https://www.train-guide.westjr.co.jp/api/v3",
     "news_rss": "https://www.nhk.or.jp/rss/news/cat0.xml",
-    "news_count": 6,
+    "news_count": 5,
+    # 何の日(記念日)を最大いくつ表示するか
+    "kinenbi_count": 2,
+    "news_font": 34,
     # 1時間降水量(Open-Meteo)。東住吉区役所付近の座標
     "lat_lon": (34.6142, 135.5285),
     "rain_hours": 12,
@@ -68,10 +71,16 @@ CONFIG = {
         {"label": "WTI原油", "kind": "usd", "sources": [("yahoo", "CL=F"), ("stooq", "cl.f")]},
         {"label": "米10年債", "kind": "yield", "sources": [("yahoo", "^TNX"), ("stooq", "10yusy.b")]},
     ],
-    "size": (1648, 1236),  # Paperwhite 5 を横向きに置いた状態で描く
+    # 縦置き(ワイヤレス充電スタンド)用。横置きに戻すなら layout="landscape", size=(1648,1236), rotate=270
+    "layout": "portrait",
+    "size": (1236, 1648),
+    # 時計を描く欄(x0, y0, x1, y1)。サーバーは空白にし、Kindle が毎分ここに時刻を描く
+    "clock_box": (40, 36, 620, 236),
+    # 市況を取得・表示するか(縦レイアウトでは使わない)
+    "show_markets": False,
     # Kindle の画面は縦長固定なので、保存時に回転させる。
     # 270 = 本体を時計回りに90度倒して置く(電源ボタンが上)想定。逆なら 90 に。
-    "rotate": 270,
+    "rotate": 0,
 }
 
 UA = "Mozilla/5.0 (personal e-ink dashboard)"
@@ -462,6 +471,64 @@ def fmt_quote(q: Quote) -> tuple[str, str]:
     return v, ch
 
 
+# ---- 暦(六曜・祝日・何の日) ----------------------------------------
+@dataclass
+class Almanac:
+    rokuyo: str = ""
+    events: list[str] = field(default_factory=list)  # 祝日 → 記念日 の順
+
+
+def calc_rokuyo(d: dt.date) -> str:
+    """旧暦から六曜を求める(qreki: 高野英明氏 QREKI.AWK の Python 移植)。"""
+    from qreki import Kyureki
+    return Kyureki.from_date(d).rokuyou
+
+
+def fetch_kinenbi(d: dt.date, dump_dir: Path | None) -> list[str]:
+    """Wikipedia「日本の記念日一覧」の本文(プレーンテキスト)から、その日の記念日を取り出す。
+    ページの書式が揃っていないため、取れなければ空のリストを返す。"""
+    from urllib.parse import quote
+    url = ("https://ja.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1"
+           "&format=json&formatversion=2&titles=" + quote("日本の記念日一覧"))
+    j = json.loads(http_get(url))
+    text = j["query"]["pages"][0].get("extract", "")
+    if dump_dir:
+        (dump_dir / "kinenbi.txt").write_text(text, encoding="utf-8")
+    # 月の見出し(== 11月 ==)で区切る
+    m = re.search(rf"^=+\s*{d.month}月\s*=+\s*$(.*?)(?=^=+\s*\d+月\s*=+\s*$|\Z)", text, re.S | re.M)
+    if not m:
+        return []
+    sec = m.group(1)
+    hit = re.search(rf"^\s*{d.day}日\s*[-－–—:：]?\s*(\S.+)$", sec, re.M)
+    if not hit:  # 「〇〇の日、△△の日 2日」のように日付が後ろに付く行もある
+        hit = re.search(rf"^(.+?)\s*{d.day}日\s*$", sec, re.M)
+    if not hit:
+        return []
+    items = [x.strip(" 　、。") for x in re.split(r"[、,]", hit.group(1))]
+    items = [x for x in items if x and not re.fullmatch(r"\d+日", x)]
+    return items[: CONFIG.get("kinenbi_count", 2)]
+
+
+def build_almanac(d: dt.date, dump_dir: Path | None, errors: list[str]) -> Almanac:
+    a = Almanac()
+    try:
+        a.rokuyo = calc_rokuyo(d)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"六曜({type(e).__name__})")
+    try:
+        import jpholiday
+        name = jpholiday.is_holiday_name(d)
+        if name:
+            a.events.append(name)
+    except Exception as e:  # noqa: BLE001
+        print("祝日の判定に失敗:", repr(e), file=sys.stderr)
+    try:
+        a.events += fetch_kinenbi(d, dump_dir)
+    except Exception as e:  # noqa: BLE001
+        print("記念日の取得に失敗:", repr(e), file=sys.stderr)
+    return a
+
+
 # ------------------------------------------------------------------
 # サンプルデータ
 # ------------------------------------------------------------------
@@ -834,6 +901,167 @@ def render(weather: Weather | None, trains: list[TrainStatus], news: list[str] |
     return p.img
 
 
+def render_portrait(weather: Weather | None, trains: list[TrainStatus], news: list[str] | None,
+                    rain: HourlyRain | None, errors: list[str], bold: str, reg: str,
+                    almanac: "Almanac | None" = None) -> Image.Image:
+    """縦長(1236x1648)レイアウト。左上の時計欄は空白にし、Kindle 側が毎分描く。"""
+    p = Painter(CONFIG["size"], bold, reg)
+    d = p.d
+    W, H = p.W, p.H
+    M = 44
+    now = dt.datetime.now(JST)
+
+    # ---- ヘッダー: 左は時計用に空ける。右に日付・六曜・何の日
+    cx0, cy0, cx1, cy1 = CONFIG["clock_box"]
+    rx = cx1 + 26
+    d.line([(rx, cy0 + 8), (rx, cy1 - 8)], fill=170, width=2)
+    tx0 = rx + 24
+    p.text((W - M, 34), f"{now.month}月{now.day}日（{WEEKDAYS[now.weekday()]}）", 60, anchor="ra")
+    yy = 112
+    if almanac and almanac.rokuyo:
+        p.text((W - M, yy), almanac.rokuyo, 36, anchor="ra")
+        yy += 50
+    if almanac and almanac.events:
+        line = p.wrap("・".join(almanac.events), 26, W - M - tx0, bold=False, max_lines=1)[0]
+        p.text((W - M, yy), line, 26, bold=False, fill=40, anchor="ra")
+    p.text((W - M, cy1 - 30), f"データ更新 {now:%H:%M}", 22, bold=False, fill=110, anchor="ra")
+    y = cy1 + 12
+    p.hline(y, x0=M, x1=W - M, w=4)
+
+    # ---- 天気(今日・明日)
+    top = y + 20
+    col_w = (W - 2 * M - 30) // 2
+    if weather and weather.days:
+        for i, label in enumerate(["今日", "明日"]):
+            if i >= len(weather.days):
+                break
+            day = weather.days[i]
+            x0 = M + i * (col_w + 30)
+            yy = top
+            p.text((x0, yy), label, 40)
+            draw_weather_icon(d, day.code, x0 + 80, yy + 128, 66)
+            tx = x0 + 188
+            if not day.tmax and i == 0 and rain and rain.current_temp is not None:
+                p.text((tx, yy + 48), f"{rain.current_temp:.0f}°", 92)
+                p.text((tx + 6, yy + 152), "現在の気温", 32, bold=False)
+            else:
+                p.text((tx, yy + 48), f"{day.tmax or '-'}°", 92)
+                if day.tmin:
+                    p.text((tx + 6, yy + 152), f"最低 {day.tmin}°", 32, bold=False)
+            for k, line in enumerate(p.wrap(day.text or "", 32, col_w - 10, bold=False, max_lines=2)):
+                p.text((x0, yy + 206 + k * 40), line, 32, bold=False)
+            labels = ["0-6", "6-12", "12-18", "18-24"]
+            pops = day.pops
+            if len(pops) < 4:
+                pops = [""] * (4 - len(pops)) + pops
+            cw = col_w / 4
+            py = yy + 292
+            for k in range(4):
+                ccx = x0 + cw * k + cw / 2
+                p.text((ccx, py), labels[k], 24, bold=False, fill=90, anchor="ma")
+                v = pops[k]
+                p.text((ccx, py + 30), f"{v}%" if v else "-", 34, anchor="ma")
+        mid = M + col_w + 15
+        d.line([(mid, top + 6), (mid, top + 360)], fill=150, width=2)
+    else:
+        p.text((M, top + 40), "天気を取得できませんでした", 40)
+    y = top + 376
+    p.hline(y, x0=M, x1=W - M, w=2, fill=120)
+
+    # ---- 週間(3日目以降・5日分)
+    y += 14
+    if weather and len(weather.days) > 2:
+        week = weather.days[2:7]
+        cw = (W - 2 * M) / len(week)
+        for k, day in enumerate(week):
+            ccx = M + cw * k + cw / 2
+            p.text((ccx, y), f"{day.date.day}({WEEKDAYS[day.date.weekday()]})", 30, anchor="ma")
+            draw_weather_icon(d, day.code, ccx, y + 78, 32)
+            p.text((ccx, y + 118), f"{day.tmax or '-'}/{day.tmin or '-'}", 30, anchor="ma")
+            p.text((ccx, y + 154), f"{day.pop}%" if day.pop else "-", 26, bold=False, anchor="ma", fill=70)
+    y += 196
+    p.hline(y, x0=M, x1=W - M, w=2, fill=120)
+
+    # ---- 1時間降水量(全幅)
+    y += 12
+    p.text((M, y), "1時間降水量", 30)
+    p.text((W - M, y + 4), "mm／今後12時間", 24, bold=False, fill=90, anchor="ra")
+    gy0, gy1 = y + 44, y + 160
+    if rain:
+        n = len(rain.mm)
+        gw = (W - 2 * M) / n
+        vmax = max(4.0, max(rain.mm))
+        for k, (h, v) in enumerate(zip(rain.hours, rain.mm)):
+            bx = M + gw * k
+            bh = (gy1 - gy0 - 28) * v / vmax
+            if v > 0:
+                d.rectangle([bx + 8, gy1 - bh, bx + gw - 8, gy1], fill=0 if v >= 1 else 120)
+                p.text((bx + gw / 2, gy1 - bh - 4), f"{v:g}", 24, anchor="md")
+            if k % 2 == 0:
+                p.text((bx + gw / 2, gy1 + 6), f"{h}時", 24, bold=False, fill=70, anchor="ma")
+        d.line([(M, gy1), (W - M, gy1)], fill=0, width=2)
+        if max(rain.mm) == 0:
+            p.text((W / 2, (gy0 + gy1) / 2), "雨の予報なし", 32, bold=False, fill=90, anchor="mm")
+    else:
+        p.text((M, gy0 + 20), "取得できず", 30, bold=False, fill=110)
+    y = gy1 + 42
+    p.hline(y, x0=M, x1=W - M, w=4)
+
+    # ---- 運行情報: 4路線を1行のチップで表示(遅れは黒地)。遅れがあるときだけ詳細を大きく出す
+    y += 18
+    p.text((M, y + 8), "運行", 34)
+    x = M + 104
+    gap = 14
+    cw = (W - M - x - gap * (len(trains) - 1)) / max(1, len(trains))
+    for t in trains:
+        bad = t.ok is False
+        unknown = t.ok is None
+        d.rounded_rectangle([x, y, x + cw, y + 58], radius=29, fill=0 if bad else 255,
+                            outline=0 if not unknown else 150, width=3)
+        lab = t.label + (" 遅延" if bad else " ?" if unknown else "")
+        p.text((x + cw / 2, y + 29), lab, 32, fill=255 if bad else (120 if unknown else 0), anchor="mm")
+        x += cw + gap
+    y += 74
+    for t in trains:
+        if t.ok is False and t.detail:
+            off = p.tw(t.label, 30) + 16
+            p.text((M, y), t.label, 30)
+            lines = p.wrap(t.detail, 30, W - 2 * M - off, bold=False, max_lines=2)
+            for k, line in enumerate(lines):
+                p.text((M + off, y + k * 40), line, 30, bold=False)
+            y += 40 * len(lines) + 6
+    y += 4
+    p.hline(y, x0=M, x1=W - M, w=4)
+
+    # ---- ニュース(残りの高さに入るだけ)
+    y += 16
+    p.text((M, y), "ニュース", 36)
+    p.text((W - M, y + 10), "NHK", 24, bold=False, fill=110, anchor="ra")
+    y += 56
+    footer_top = H - 50
+    if news:
+        nf = CONFIG.get("news_font", 34)
+        step = nf + 14
+        for title in news[: CONFIG["news_count"]]:
+            if y + step > footer_top:
+                break
+            line = p.wrap(title, nf, W - 2 * M - 32, bold=False, max_lines=1)[0]
+            d.rectangle([M, y + nf // 2 - 4, M + 10, y + nf // 2 + 6], fill=0)
+            p.text((M + 30, y), line, nf, bold=False)
+            y += step
+    else:
+        p.text((M, y), "ニュースを取得できませんでした", 32, bold=False)
+
+    # ---- フッター
+    p.hline(H - 44, x0=M, x1=W - M, w=1, fill=160)
+    foot = f"{CONFIG['place_label']}  天気: 気象庁/Open-Meteo  鉄道: JR西日本/Yahoo!路線情報  ニュース: NHK  何の日: Wikipedia"
+    if errors:
+        foot = "取得エラー: " + ", ".join(errors)
+    foot = p.wrap(foot, 20, W - 2 * M, max_lines=1)[0]
+    p.text((M, H - 34), foot, 20, bold=False, fill=90)
+    return p.img
+
+
 # ------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -858,8 +1086,10 @@ def main():
         dump_dir.mkdir(parents=True, exist_ok=True)
 
     errors: list[str] = []
+    today = dt.datetime.now(JST).date()
     if args.mock:
         weather, trains, news, rain, markets, markets_at = mock_data()
+        almanac = Almanac(calc_rokuyo(today), ["阪神タイガース記念日", "タイツの日"])
     else:
         try:
             weather = fetch_weather(dump_dir)
@@ -883,12 +1113,18 @@ def main():
             rain = None
             errors.append(f"降水量({type(e).__name__})")
             print("降水量の取得に失敗:", repr(e), file=sys.stderr)
-        markets, markets_at = load_markets(out.parent / "markets_cache.json", dump_dir, args.refresh_markets)
-        missing = [q.label for q in markets if q.value is None]
-        if missing:
-            errors.append("市況(" + "・".join(missing) + ")")
+        almanac = build_almanac(today, dump_dir, errors)
+        markets, markets_at = [], None
+        if CONFIG.get("show_markets"):
+            markets, markets_at = load_markets(out.parent / "markets_cache.json", dump_dir, args.refresh_markets)
+            missing = [q.label for q in markets if q.value is None]
+            if missing:
+                errors.append("市況(" + "・".join(missing) + ")")
 
-    img = render(weather, trains, news, rain, markets, markets_at, errors, bold, reg)
+    if CONFIG.get("layout") == "portrait":
+        img = render_portrait(weather, trains, news, rain, errors, bold, reg, almanac)
+    else:
+        img = render(weather, trains, news, rain, markets, markets_at, errors, bold, reg)
     # Kindleは16階調。量子化してから保存するとe-inkで滲みにくい
     img = img.point(lambda v: round(v / 17) * 17)
     # 横向きのプレビューも残す(確認用)
