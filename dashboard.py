@@ -47,13 +47,16 @@ CONFIG = {
     "yahoo_area_url": "https://transit.yahoo.co.jp/diainfo/area/6",
     "jrwest_base": "https://www.train-guide.westjr.co.jp/api/v3",
     "news_rss": "https://www.nhk.or.jp/rss/news/cat0.xml",
-    "news_count": 5,
+    "news_count": 4,
     # 何の日(記念日)を最大いくつ表示するか
     "kinenbi_count": 2,
     "news_font": 34,
     # 1時間降水量(Open-Meteo)。東住吉区役所付近の座標
     "lat_lon": (34.6142, 135.5285),
-    "rain_hours": 12,
+    "rain_hours": 24,
+    # 気圧の急な低下の目安(3時間あたりの低下量 hPa)。頭痛ーる等の判定式は非公開のため独自の目安
+    "pressure_warn_3h": 2.0,
+    "pressure_alert_3h": 4.0,
     # JR は近畿エリアのうち、ここに含まれる路線の遅れだけを表示する(路線名の部分一致)
     "jr_watch": ["大阪環状線", "阪和線", "大和路線", "京都線", "神戸線", "東西線", "ゆめ咲線"],
     # 市況の更新時刻(JST)。それ以外の実行時は前回取得分(キャッシュ)を表示する
@@ -316,13 +319,14 @@ class HourlyRain:
     hours: list[int]       # 時(0-23)
     mm: list[float]        # 1時間降水量 mm
     current_temp: float | None = None  # 現在気温(夜は今日の最高気温の代わりに表示)
+    hpa: list[float] = field(default_factory=list)  # 海面気圧 hPa(hours と同じ時刻)
 
 
 def fetch_rain(dump_dir: Path | None) -> HourlyRain:
     """Open-Meteo の1時間降水量予報。日本域では気象庁モデルを含む合成予報になる。"""
     lat, lon = CONFIG["lat_lon"]
     url = ("https://api.open-meteo.com/v1/forecast"
-           f"?latitude={lat}&longitude={lon}&hourly=precipitation"
+           f"?latitude={lat}&longitude={lon}&hourly=precipitation,pressure_msl"
            "&current=temperature_2m&timezone=Asia%2FTokyo&forecast_days=2")
     raw = http_get(url)
     if dump_dir:
@@ -330,17 +334,19 @@ def fetch_rain(dump_dir: Path | None) -> HourlyRain:
     j = json.loads(raw)
     times = j["hourly"]["time"]
     vals = j["hourly"]["precipitation"]
+    prs = j["hourly"].get("pressure_msl") or [None] * len(vals)
     now = dt.datetime.now(JST).replace(minute=0, second=0, microsecond=0, tzinfo=None)
-    hours, mm = [], []
-    for t, v in zip(times, vals):
+    hours, mm, hpa = [], [], []
+    for t, v, pr in zip(times, vals, prs):
         tm = dt.datetime.fromisoformat(t)
         if tm >= now and len(hours) < CONFIG["rain_hours"]:
             hours.append(tm.hour)
             mm.append(float(v or 0))
+            hpa.append(float(pr) if pr is not None else float("nan"))
     if not hours:
         raise ValueError("予報データが空")
     cur = (j.get("current") or {}).get("temperature_2m")
-    return HourlyRain(hours, mm, cur)
+    return HourlyRain(hours, mm, cur, hpa)
 
 
 # ---- 市況 ------------------------------------------------------------
@@ -558,8 +564,11 @@ def mock_data():
         "（サンプル）プロ野球 日本シリーズ第2戦の結果",
         "（サンプル）新しい紙の保険証の扱い 厚労省が方針示す",
     ]
-    rain = HourlyRain(hours=[(dt.datetime.now(JST).hour + i) % 24 for i in range(12)],
-                      mm=[0, 0, 0.5, 1.5, 4.0, 2.5, 1.0, 0, 0, 0, 0.5, 0])
+    h0 = dt.datetime.now(JST).hour
+    rain = HourlyRain(hours=[(h0 + i) % 24 for i in range(24)],
+                      mm=[0, 0, 0.5, 1.5, 4.0, 2.5, 1.0, 0, 0, 0, 0.5, 0] + [0] * 12,
+                      hpa=[1014, 1013.5, 1013, 1012, 1010.5, 1009, 1007.5, 1006.5, 1006, 1006, 1006.5, 1007,
+                           1008, 1009, 1010, 1011, 1011.5, 1012, 1012.5, 1013, 1013, 1013.5, 1013.5, 1014])
     markets = [
         Quote("ドル円", 152.48, 152.11, "fx"), Quote("日経平均", 39_812.55, 39_605.10),
         Quote("TOPIX", 2_745.31, 2_751.02), Quote("ダウ", 43_120.64, 42_980.40),
@@ -949,23 +958,23 @@ def render_portrait(weather: Weather | None, trains: list[TrainStatus], news: li
                 if day.tmin:
                     p.text((tx + 6, yy + 152), f"最低 {day.tmin}°", 32, bold=False)
             for k, line in enumerate(p.wrap(day.text or "", 32, col_w - 10, bold=False, max_lines=2)):
-                p.text((x0, yy + 206 + k * 40), line, 32, bold=False)
+                p.text((x0, yy + 204 + k * 40), line, 32, bold=False)
             labels = ["0-6", "6-12", "12-18", "18-24"]
             pops = day.pops
             if len(pops) < 4:
                 pops = [""] * (4 - len(pops)) + pops
             cw = col_w / 4
-            py = yy + 292
+            py = yy + 290
             for k in range(4):
                 ccx = x0 + cw * k + cw / 2
                 p.text((ccx, py), labels[k], 24, bold=False, fill=90, anchor="ma")
                 v = pops[k]
                 p.text((ccx, py + 30), f"{v}%" if v else "-", 34, anchor="ma")
         mid = M + col_w + 15
-        d.line([(mid, top + 6), (mid, top + 360)], fill=150, width=2)
+        d.line([(mid, top + 6), (mid, top + 364)], fill=150, width=2)
     else:
         p.text((M, top + 40), "天気を取得できませんでした", 40)
-    y = top + 376
+    y = top + 380
     p.hline(y, x0=M, x1=W - M, w=2, fill=120)
 
     # ---- 週間(3日目以降・5日分)
@@ -978,33 +987,77 @@ def render_portrait(weather: Weather | None, trains: list[TrainStatus], news: li
             p.text((ccx, y), f"{day.date.day}({WEEKDAYS[day.date.weekday()]})", 30, anchor="ma")
             draw_weather_icon(d, day.code, ccx, y + 78, 32)
             p.text((ccx, y + 118), f"{day.tmax or '-'}/{day.tmin or '-'}", 30, anchor="ma")
-            p.text((ccx, y + 154), f"{day.pop}%" if day.pop else "-", 26, bold=False, anchor="ma", fill=70)
+            p.text((ccx, y + 150), f"{day.pop}%" if day.pop else "-", 26, bold=False, anchor="ma", fill=70)
     y += 196
     p.hline(y, x0=M, x1=W - M, w=2, fill=120)
 
-    # ---- 1時間降水量(全幅)
+    # ---- 1時間降水量(今後12時間)
     y += 12
     p.text((M, y), "1時間降水量", 30)
     p.text((W - M, y + 4), "mm／今後12時間", 24, bold=False, fill=90, anchor="ra")
-    gy0, gy1 = y + 44, y + 160
+    gy0, gy1 = y + 42, y + 136
     if rain:
-        n = len(rain.mm)
-        gw = (W - 2 * M) / n
-        vmax = max(4.0, max(rain.mm))
-        for k, (h, v) in enumerate(zip(rain.hours, rain.mm)):
+        mm12, hr12 = rain.mm[:12], rain.hours[:12]
+        gw = (W - 2 * M) / len(mm12)
+        vmax = max(4.0, max(mm12))
+        for k, (h, v) in enumerate(zip(hr12, mm12)):
             bx = M + gw * k
-            bh = (gy1 - gy0 - 28) * v / vmax
+            bh = (gy1 - gy0 - 26) * v / vmax
             if v > 0:
                 d.rectangle([bx + 8, gy1 - bh, bx + gw - 8, gy1], fill=0 if v >= 1 else 120)
-                p.text((bx + gw / 2, gy1 - bh - 4), f"{v:g}", 24, anchor="md")
+                p.text((bx + gw / 2, gy1 - bh - 4), f"{v:g}", 22, anchor="md")
             if k % 2 == 0:
-                p.text((bx + gw / 2, gy1 + 6), f"{h}時", 24, bold=False, fill=70, anchor="ma")
+                p.text((bx + gw / 2, gy1 + 6), f"{h}時", 22, bold=False, fill=70, anchor="ma")
         d.line([(M, gy1), (W - M, gy1)], fill=0, width=2)
-        if max(rain.mm) == 0:
+        if max(mm12) == 0:
             p.text((W / 2, (gy0 + gy1) / 2), "雨の予報なし", 32, bold=False, fill=90, anchor="mm")
     else:
         p.text((M, gy0 + 20), "取得できず", 30, bold=False, fill=110)
-    y = gy1 + 42
+    y = gy1 + 40
+    p.hline(y, x0=M, x1=W - M, w=2, fill=120)
+
+    # ---- 気圧: 一言の要約＋24時間の帯(3時間で下がる量で 安定/注意/警戒)
+    y += 12
+    hpa = rain.hpa if rain else []
+    ok = [v for v in hpa if v == v]
+    if len(ok) >= 4:
+        n = len(hpa)
+
+        def level(k):
+            j = min(n - 1, k + 3)
+            if hpa[k] != hpa[k] or hpa[j] != hpa[j]:
+                return 0
+            drop = hpa[k] - hpa[j]
+            return 2 if drop >= CONFIG["pressure_alert_3h"] else 1 if drop >= CONFIG["pressure_warn_3h"] else 0
+
+        lv = [level(k) for k in range(n)]
+        top_lv = max(lv)
+        badge = ["気圧 安定", "気圧 注意", "気圧 警戒"][top_lv]
+        d.rounded_rectangle([M, y, M + 236, y + 60], radius=10, fill=0 if top_lv else 255, outline=0, width=3)
+        p.text((M + 118, y + 30), badge, 32, fill=255 if top_lv else 0, anchor="mm")
+        lo = min(ok)
+        kl = hpa.index(lo)
+        ks = next((k for k in range(n) if lv[k]), None)
+        if ks is not None:
+            msg = f"{rain.hours[ks]}時ごろから下がり、{rain.hours[kl]}時ごろ最低 {lo:.0f}hPa"
+        else:
+            hi = max(ok)
+            msg = f"大きな変化なし（{lo:.0f}〜{hi:.0f}hPa）"
+        tx = M + 260
+        line = p.wrap(msg, 32, W - M - tx, bold=False, max_lines=1)[0]
+        p.text((tx, y - 2), line, 32, bold=False)
+        p.text((tx, y + 40), f"今 {ok[0]:.0f}hPa", 24, bold=False, fill=70)
+        by = y + 80
+        gw = (W - 2 * M) / n
+        for k in range(n):
+            d.rectangle([M + gw * k, by, M + gw * (k + 1), by + 24],
+                        fill={0: 255, 1: 160, 2: 0}[lv[k]], outline=190)
+            if k % 3 == 0:
+                p.text((M + gw * k + 2, by + 26), f"{rain.hours[k]}時", 20, bold=False, fill=90)
+        y = by + 56
+    else:
+        p.text((M, y + 10), "気圧：取得できず", 28, bold=False, fill=110)
+        y += 60
     p.hline(y, x0=M, x1=W - M, w=4)
 
     # ---- 運行情報: 4路線を1行のチップで表示(遅れは黒地)。遅れがあるときだけ詳細を大きく出す
@@ -1041,7 +1094,7 @@ def render_portrait(weather: Weather | None, trains: list[TrainStatus], news: li
     footer_top = H - 50
     if news:
         nf = CONFIG.get("news_font", 34)
-        step = nf + 14
+        step = nf + 12
         for title in news[: CONFIG["news_count"]]:
             if y + step > footer_top:
                 break
