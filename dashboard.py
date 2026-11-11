@@ -551,7 +551,7 @@ def mock_data():
             pop=str([10, 20, 70, 40, 20, 10, 50][i]),
         ))
     trains = [
-        TrainStatus("JR西日本(近畿)", "遅れあり", "大阪環状線: 17:40頃、天王寺駅での安全確認の影響で、一部列車に遅れが出ています。", False),
+        TrainStatus("JR", "遅れあり", "大阪環状線: 17:40頃、天王寺駅での安全確認の影響で、一部列車に遅れが出ています。", False),
         TrainStatus("御堂筋線", "平常運転", "", True),
         TrainStatus("谷町線", "平常運転", "", True),
         TrainStatus("京阪電車", "平常運転", "", True),
@@ -1072,7 +1072,10 @@ def render_portrait(weather: Weather | None, trains: list[TrainStatus], news: li
         d.rounded_rectangle([x, y, x + cw, y + 58], radius=29, fill=0 if bad else 255,
                             outline=0 if not unknown else 150, width=3)
         lab = t.label + (" 遅延" if bad else " ?" if unknown else "")
-        p.text((x + cw / 2, y + 29), lab, 32, fill=255 if bad else (120 if unknown else 0), anchor="mm")
+        fs = 32
+        while fs > 20 and p.tw(lab, fs) > cw - 24:  # 長い路線名は文字を小さくして収める
+            fs -= 2
+        p.text((x + cw / 2, y + 29), lab, fs, fill=255 if bad else (120 if unknown else 0), anchor="mm")
         x += cw + gap
     y += 74
     for t in trains:
